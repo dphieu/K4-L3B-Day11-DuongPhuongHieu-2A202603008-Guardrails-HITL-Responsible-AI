@@ -67,32 +67,40 @@ class ConfidenceRouter:
         Returns:
             RoutingDecision with routing action and metadata
         """
-        # Optional: Implement routing logic
-        #
-        # 1. Check if action_type is in HIGH_RISK_ACTIONS
-        #    -> If yes: always escalate (action="escalate", priority="high",
-        #       requires_human=True, reason="High-risk action: {action_type}")
-        #
-        # 2. Check confidence thresholds:
-        #    - confidence >= 0.9:
-        #      action="auto_send", priority="low",
-        #      requires_human=False, reason="High confidence"
-        #
-        #    - 0.7 <= confidence < 0.9:
-        #      action="queue_review", priority="normal",
-        #      requires_human=True, reason="Medium confidence — needs review"
-        #
-        #    - confidence < 0.7:
-        #      action="escalate", priority="high",
-        #      requires_human=True, reason="Low confidence — escalating"
+        # 1. High-risk banking actions always need a human, whatever the score.
+        if action_type in HIGH_RISK_ACTIONS:
+            return RoutingDecision(
+                action="escalate",
+                confidence=confidence,
+                reason=f"High-risk action: {action_type}",
+                priority="high",
+                requires_human=True,
+            )
 
+        # 2. Confidence bands.
+        if confidence >= self.HIGH_THRESHOLD:
+            return RoutingDecision(
+                action="auto_send",
+                confidence=confidence,
+                reason="High confidence",
+                priority="low",
+                requires_human=False,
+            )
+        if confidence >= self.MEDIUM_THRESHOLD:
+            return RoutingDecision(
+                action="queue_review",
+                confidence=confidence,
+                reason="Medium confidence — needs review",
+                priority="normal",
+                requires_human=True,
+            )
         return RoutingDecision(
-            action="auto_send",
+            action="escalate",
             confidence=confidence,
-            reason="TODO: implement routing logic",
-            priority="low",
-            requires_human=False,
-        )  # TODO: Replace with implementation
+            reason="Low confidence — escalating",
+            priority="high",
+            requires_human=True,
+        )
 
 
 # ============================================================
@@ -115,33 +123,84 @@ class ConfidenceRouter:
 hitl_decision_points = [
     {
         "id": 1,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
-        "approval_path": "TODO: Explain approve, reject and timeout behavior",
-        "audit_fields": "TODO: List correlation ID, intent, diff and reviewer decision",
+        "name": "High-risk money movement approval",
+        "trigger": (
+            "Any transfer_money / close_account / change_password / delete_data / "
+            "update_personal_info action, regardless of model confidence or claimed "
+            "authority."
+        ),
+        "hitl_model": "human-in-the-loop (blocking approval before the sink runs)",
+        "context_needed": (
+            "Customer ID, source and destination account, amount, currency, the "
+            "originating message thread, and the model's proposed action as a diff."
+        ),
+        "example": (
+            "Customer asks to transfer 500,000,000 VND to a new payee. The agent "
+            "proposes the transfer; a human agent must approve before the egress "
+            "call to api.vinbank.example."
+        ),
+        "approval_path": (
+            "Approve → action executes with the approval id. Reject → action dropped "
+            "and customer told it needs branch verification. Timeout (e.g. 15 min) → "
+            "treated as reject and escalated to the fraud queue."
+        ),
+        "audit_fields": (
+            "correlation_id, user_id, intent, proposed_action_diff, reviewer_id, "
+            "approval_id (HITL-XXXXXXXX), decision, decided_at."
+        ),
     },
     {
         "id": 2,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
-        "approval_path": "TODO: Explain approve, reject and timeout behavior",
-        "audit_fields": "TODO: List correlation ID, intent, diff and reviewer decision",
+        "name": "Secret / PII leak containment",
+        "trigger": (
+            "Output guardrail finds a password, sk-* API key, *.internal host, "
+            "national ID, phone or email in a draft reply."
+        ),
+        "hitl_model": "human-on-the-loop (auto-redact now, review the incident after)",
+        "context_needed": (
+            "Redacted vs original draft, which pattern matched, the prompt that "
+            "produced it, and the target agent (Blue / Red / Red Advance)."
+        ),
+        "example": (
+            "A jailbreak coaxes the model into echoing the admin password; the "
+            "output filter replaces the reply and files a security incident."
+        ),
+        "approval_path": (
+            "Auto-redact ships immediately; a security reviewer confirms the "
+            "incident, tunes the rule, and may raise a hardening ticket. No release "
+            "of the raw secret at any point."
+        ),
+        "audit_fields": (
+            "correlation_id, matched_pattern, original_preview_hash, redacted_reply, "
+            "reviewer_id, incident_status."
+        ),
     },
     {
         "id": 3,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
-        "approval_path": "TODO: Explain approve, reject and timeout behavior",
-        "audit_fields": "TODO: List correlation ID, intent, diff and reviewer decision",
+        "name": "Low-confidence answer escalation",
+        "trigger": (
+            "ConfidenceRouter returns queue_review (0.7–0.9) or escalate (<0.7), e.g. "
+            "ambiguous product/rate questions or hallucination risk."
+        ),
+        "hitl_model": "human-as-tiebreaker (only when the router is unsure)",
+        "context_needed": (
+            "The customer question, the draft answer, the confidence score, and the "
+            "ground-truth reference from data/pii_hallucination_samples.json."
+        ),
+        "example": (
+            "Customer asks for a rate that is not in ground truth; the model is 0.6 "
+            "confident. The answer is queued so a human confirms the real figure "
+            "before it reaches the customer."
+        ),
+        "approval_path": (
+            "Approve → answer sent as-is. Edit → reviewer corrects the figure and "
+            "sends the corrected reply. Reject/timeout → a safe holding message is "
+            "sent and a human follows up."
+        ),
+        "audit_fields": (
+            "correlation_id, intent, confidence, draft_answer, ground_truth_ref, "
+            "reviewer_id, decision, final_answer."
+        ),
     },
 ]
 
